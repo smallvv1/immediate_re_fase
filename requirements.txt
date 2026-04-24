@@ -11,3 +11,6 @@ openai
 paddleocr
 paddlepaddle
 harvesters
+fastapi
+uvicorn
+python-multipart

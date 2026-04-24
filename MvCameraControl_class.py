@@ -3,6 +3,8 @@
 import sys
 import copy
 import ctypes
+import os
+from pathlib import Path
 
 from ctypes import *
 
@@ -11,7 +13,49 @@ from CameraParams_const import *
 from CameraParams_header import *
 from MvErrorDefine_const import *
 
-MvCamCtrldll = WinDLL("C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64\MvCameraControl.dll")
+def _load_mv_camera_dll():
+    dll_name = "MvCameraControl.dll"
+    candidates = []
+
+    env_dll_path = os.environ.get("MVS_DLL_PATH", "").strip()
+    if env_dll_path:
+        candidates.append(Path(env_dll_path))
+
+    env_home = os.environ.get("MVS_HOME", "").strip()
+    if env_home:
+        candidates.append(Path(env_home) / dll_name)
+        candidates.append(Path(env_home) / "Runtime" / "Win64_x64" / dll_name)
+        candidates.append(Path(env_home) / "Runtime" / "Win32_i86" / dll_name)
+        candidates.append(Path(env_home) / "MvImport" / dll_name)
+        candidates.append(Path(env_home).parent / "Runtime" / "Win64_x64" / dll_name)
+        candidates.append(Path(env_home).parent / "Runtime" / "Win32_i86" / dll_name)
+
+    candidates.extend(
+        [
+            Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64") / dll_name,
+            Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win32_i86") / dll_name,
+            Path(r"C:\Program Files\Common Files\MVS\Runtime\Win64_x64") / dll_name,
+            Path(r"C:\Program Files\Common Files\MVS\Runtime\Win32_i86") / dll_name,
+        ]
+    )
+
+    for p in candidates:
+        if p.exists():
+            return WinDLL(str(p))
+
+    # As a last attempt, rely on PATH.
+    try:
+        return WinDLL(dll_name)
+    except Exception:
+        candidate_text = "\n".join(str(p) for p in candidates)
+        raise FileNotFoundError(
+            "Cannot load MvCameraControl.dll. Checked paths:\n"
+            + candidate_text
+            + "\nYou can set MVS_HOME to your MVS install root."
+        )
+
+
+MvCamCtrldll = _load_mv_camera_dll()
 
 # 用于回调函数传入相机实例
 class _MV_PY_OBJECT_(Structure):

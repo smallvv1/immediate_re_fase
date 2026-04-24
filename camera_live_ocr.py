@@ -14,6 +14,7 @@ import sys
 import time
 import datetime
 import argparse
+import re
 import cv2
 import numpy as np
 from pathlib import Path
@@ -36,11 +37,87 @@ except ImportError:
     print("[WARN] PaddleOCR 或 YOLO 未安装，将仅提供预览功能")
 
 
+TH_CONFUSION_TO_DIGIT = {
+    "O": "0",
+    "Q": "0",
+    "D": "0",
+    "I": "1",
+    "L": "1",
+    "Z": "2",
+    "H": "2",
+    "S": "5",
+    "G": "6",
+    "B": "8",
+}
+
+AE_PROFILE_TARGET = {
+    "day": 105,
+    "night": 155,
+}
+
+
+def _correct_th_token(token):
+    token = token.strip().upper()
+    if len(token) < 4 or not token.startswith("TH"):
+        return ""
+
+    suffix = token[2:4]
+    corrected_digits = []
+    for char in suffix:
+        if char.isdigit():
+            corrected_digits.append(char)
+            continue
+        mapped = TH_CONFUSION_TO_DIGIT.get(char)
+        if mapped is None:
+            return ""
+        corrected_digits.append(mapped)
+    return f"TH{''.join(corrected_digits)}"
+
+
+def extract_best_th_code(raw_text):
+    if not raw_text:
+        return ""
+
+    merged = raw_text.upper().replace(" ", "")
+    candidates = re.findall(r"TH[A-Z0-9]{2}", merged)
+    for candidate in candidates:
+        corrected = _correct_th_token(candidate)
+        if corrected:
+            return corrected
+    return ""
+
+
+def normalize_th_codes_in_text(raw_text):
+    if not raw_text:
+        return ""
+
+    normalized = re.sub(r"\s+", " ", raw_text.strip().upper())
+
+    def _replace_token(match):
+        token = match.group(0)
+        corrected = _correct_th_token(token)
+        return corrected if corrected else token
+
+    return re.sub(r"TH[A-Z0-9]{2}", _replace_token, normalized)
+
+
 class CameraLiveOCR:
-    def __init__(self, exposure_time=10000, gain=7.0):
+    def __init__(
+        self,
+        exposure_time=10000,
+        gain=7.0,
+        auto_exposure=True,
+        auto_gain=True,
+        ae_target_brightness=120,
+        ae_settle_frames=6,
+    ):
         self.camera = None
         self.exposure_time = exposure_time
         self.gain = gain
+        self.auto_exposure = auto_exposure
+        self.auto_gain = auto_gain
+        self.ae_target_brightness = int(max(30, min(220, int(ae_target_brightness))))
+        self.ae_settle_frames = max(0, int(ae_settle_frames))
         self.is_running = False
         self.last_capture_path = None
         self.frame_count = 0
@@ -108,18 +185,70 @@ class CameraLiveOCR:
         height = stParam.nCurValue
         print(f"[INFO] 分辨率: {width}x{height}")
         
-        # 关闭自动曝光和增益
-        self.camera.MV_CC_SetEnumValue("ExposureAuto", 0)
-        self.camera.MV_CC_SetEnumValue("GainAuto", 0)
-        
-        # 设置曝光和增益
-        self.camera.MV_CC_SetFloatValue("ExposureTime", self.exposure_time)
-        self.camera.MV_CC_SetFloatValue("Gain", self.gain)
+        # 曝光模式：自动或手动
+        if self.auto_exposure:
+            ret_exp = self.camera.MV_CC_SetEnumValue("ExposureAuto", 2)
+            if ret_exp != 0:
+                print(f"[WARN] 开启自动曝光失败，错误码: {ret_exp}，将回退为手动曝光")
+                self.camera.MV_CC_SetEnumValue("ExposureAuto", 0)
+                self.camera.MV_CC_SetFloatValue("ExposureTime", self.exposure_time)
+            else:
+                print("[INFO] 自动曝光: 已开启")
+                self._apply_auto_exposure_target()
+        else:
+            self.camera.MV_CC_SetEnumValue("ExposureAuto", 0)
+            ret_time = self.camera.MV_CC_SetFloatValue("ExposureTime", self.exposure_time)
+            if ret_time != 0:
+                print(f"[WARN] 设置手动曝光时间失败，错误码: {ret_time}")
+            else:
+                print(f"[INFO] 手动曝光: {self.exposure_time} us")
+
+        # 增益模式：自动或手动
+        if self.auto_gain:
+            ret_gain_auto = self.camera.MV_CC_SetEnumValue("GainAuto", 2)
+            if ret_gain_auto != 0:
+                print(f"[WARN] 开启自动增益失败，错误码: {ret_gain_auto}，将回退为手动增益")
+                self.camera.MV_CC_SetEnumValue("GainAuto", 0)
+                self.camera.MV_CC_SetFloatValue("Gain", self.gain)
+            else:
+                print("[INFO] 自动增益: 已开启")
+        else:
+            self.camera.MV_CC_SetEnumValue("GainAuto", 0)
+            ret_gain = self.camera.MV_CC_SetFloatValue("Gain", self.gain)
+            if ret_gain != 0:
+                print(f"[WARN] 设置手动增益失败，错误码: {ret_gain}")
+            else:
+                print(f"[INFO] 手动增益: {self.gain}")
         
         # 开始抓图
         ret = self.camera.MV_CC_StartGrabbing()
         if ret != 0:
             print(f"[ERROR] 开始抓图失败，错误码: {ret}")
+            return
+
+        if (self.auto_exposure or self.auto_gain) and self.ae_settle_frames > 0:
+            print(f"[INFO] 等待自动曝光/增益稳定: {self.ae_settle_frames} 帧...")
+            for _ in range(self.ae_settle_frames):
+                self.get_frame()
+
+    def _apply_auto_exposure_target(self):
+        """设置自动曝光目标亮度（不同型号节点名可能不同）"""
+        target = int(self.ae_target_brightness)
+        candidates = [
+            "AutoExposureTargetBrightness",
+            "AutoExposureTargetGrayValue",
+            "TargetBrightness",
+            "TargetGrayValue",
+        ]
+
+        for node_name in candidates:
+            ret = self.camera.MV_CC_SetIntValue(node_name, target)
+            if ret == 0:
+                print(f"[INFO] 自动曝光目标亮度: {target} (节点: {node_name})")
+                return True
+
+        print(f"[WARN] 当前相机不支持设置自动曝光目标亮度（期望值: {target}）")
+        return False
     
     def get_frame(self):
         """获取一帧图像"""
@@ -267,8 +396,13 @@ class CameraLiveOCR:
                                 text = " ".join(first.rec_texts)
                             elif isinstance(first, list):
                                 text = " ".join([line[1][0] for line in first if len(line) > 1 and len(line[1]) > 0])
-                        
-                        result_text = f"[{cls_name} #{detection_count}] 识别文字: {text.strip()}"
+
+                        normalized_text = normalize_th_codes_in_text(text)
+                        corrected_th = extract_best_th_code(normalized_text)
+                        if corrected_th:
+                            result_text = f"[{cls_name} #{detection_count}] 识别文字: {normalized_text} | TH编码: {corrected_th}"
+                        else:
+                            result_text = f"[{cls_name} #{detection_count}] 识别文字: {normalized_text}"
                         print(f"[OCR] {result_text}")
                         log_file.write(result_text + "\n")
                     
@@ -366,10 +500,23 @@ def main():
 示例：
   python camera_live_ocr.py
   python camera_live_ocr.py --exposure 15000 --gain 8.0
+    python camera_live_ocr.py --ae-profile day
+    python camera_live_ocr.py --ae-profile night
+    python camera_live_ocr.py --ae-profile custom --ae-target-brightness 135
         """
     )
     parser.add_argument("--exposure", type=float, default=10000, help="曝光时间（微秒）")
     parser.add_argument("--gain", type=float, default=7.0, help="增益值")
+    parser.add_argument("--auto-exposure", action="store_true", help="开启自动曝光（默认开启）")
+    parser.add_argument("--manual-exposure", action="store_true", help="关闭自动曝光，使用 --exposure")
+    parser.add_argument("--auto-gain", action="store_true", help="开启自动增益（默认开启）")
+    parser.add_argument("--manual-gain", action="store_true", help="关闭自动增益，使用 --gain")
+    parser.add_argument("--ae-profile", choices=["day", "night", "custom"], default="day",
+                        help="自动曝光亮度档位：day(默认)/night/custom")
+    parser.add_argument("--ae-target-brightness", type=int, default=120,
+                        help="自动曝光目标亮度(仅 custom 档位生效，建议 90~170)")
+    parser.add_argument("--ae-settle-frames", type=int, default=6,
+                        help="自动曝光/增益稳定帧数，默认 6")
     
     args = parser.parse_args()
     
@@ -379,7 +526,31 @@ def main():
     print("╚" + "="*58 + "╝")
     print()
     
-    camera = CameraLiveOCR(exposure_time=args.exposure, gain=args.gain)
+    auto_exposure = True
+    if args.manual_exposure:
+        auto_exposure = False
+    elif args.auto_exposure:
+        auto_exposure = True
+
+    auto_gain = True
+    if args.manual_gain:
+        auto_gain = False
+    elif args.auto_gain:
+        auto_gain = True
+
+    if args.ae_profile == "custom":
+        ae_target_brightness = int(args.ae_target_brightness)
+    else:
+        ae_target_brightness = AE_PROFILE_TARGET[args.ae_profile]
+
+    camera = CameraLiveOCR(
+        exposure_time=args.exposure,
+        gain=args.gain,
+        auto_exposure=auto_exposure,
+        auto_gain=auto_gain,
+        ae_target_brightness=ae_target_brightness,
+        ae_settle_frames=args.ae_settle_frames,
+    )
     camera.run_live_preview()
 
 

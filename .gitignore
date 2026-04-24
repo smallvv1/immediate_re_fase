@@ -38,3 +38,4 @@ ehthumbs.db
 dist/
 build/
 *.spec
+web_frontend/node_modules/

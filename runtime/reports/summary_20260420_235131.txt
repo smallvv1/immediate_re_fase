@@ -1,0 +1,7 @@
+Timestamp: 2026-04-20T23:51:31
+Overall status: missing_detected
+Images processed: 1
+
+Missing details:
+- pliers: required=1, found=0, missing=1, missing_codes=['TH01']
+- wrench: required=1, found=0, missing=1, missing_codes=['TH02']

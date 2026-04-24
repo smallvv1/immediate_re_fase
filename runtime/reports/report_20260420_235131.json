@@ -1,0 +1,102 @@
+{
+  "timestamp": "2026-04-20T23:51:31",
+  "config_path": "D:\\code\\py-projects\\EzYOLO-main\\config\\toolbox_workflow.json",
+  "model_path": "D:\\code\\py-projects\\EzYOLO-main\\runs\\detect\\runs\\train\\exp_2\\weights\\best.pt",
+  "ocr_status": "failed: Encounter exception when download model from bos. No model source is available! Please check network or use local model files!",
+  "image_count": 1,
+  "image_reports": [
+    {
+      "image_path": "D:\\code\\py-projects\\EzYOLO-main\\capture_clear_20260417_145850.jpg",
+      "status": "ok",
+      "detection_count": 4,
+      "annotated_image_path": "D:\\code\\py-projects\\EzYOLO-main\\runtime\\annotated\\capture_clear_20260417_145850_annotated.jpg",
+      "detections": [
+        {
+          "class_id": 0,
+          "class_name": "die",
+          "confidence": 0.549,
+          "bbox": {
+            "x1": 571,
+            "y1": 2511,
+            "x2": 999,
+            "y2": 2953
+          },
+          "ocr_texts": [],
+          "ocr_codes": []
+        },
+        {
+          "class_id": 0,
+          "class_name": "die",
+          "confidence": 0.5033,
+          "bbox": {
+            "x1": 3058,
+            "y1": 565,
+            "x2": 3497,
+            "y2": 1051
+          },
+          "ocr_texts": [],
+          "ocr_codes": []
+        },
+        {
+          "class_id": 0,
+          "class_name": "die",
+          "confidence": 0.4765,
+          "bbox": {
+            "x1": 3462,
+            "y1": 346,
+            "x2": 3905,
+            "y2": 842
+          },
+          "ocr_texts": [],
+          "ocr_codes": []
+        },
+        {
+          "class_id": 0,
+          "class_name": "die",
+          "confidence": 0.4761,
+          "bbox": {
+            "x1": 986,
+            "y1": 2303,
+            "x2": 1361,
+            "y2": 2696
+          },
+          "ocr_texts": [],
+          "ocr_codes": []
+        }
+      ]
+    }
+  ],
+  "missing_evaluation": {
+    "status": "missing_detected",
+    "total_missing_items": 2,
+    "total_missing_codes": 2,
+    "details": [
+      {
+        "class_name": "pliers",
+        "required_count": 1,
+        "found_count": 0,
+        "missing_count": 1,
+        "required_codes": [
+          "TH01"
+        ],
+        "found_codes": [],
+        "missing_codes": [
+          "TH01"
+        ]
+      },
+      {
+        "class_name": "wrench",
+        "required_count": 1,
+        "found_count": 0,
+        "missing_count": 1,
+        "required_codes": [
+          "TH02"
+        ],
+        "found_codes": [],
+        "missing_codes": [
+          "TH02"
+        ]
+      }
+    ]
+  }
+}
