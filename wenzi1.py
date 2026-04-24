@@ -3,6 +3,7 @@ import sys
 import cv2
 import glob
 import re
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, List
 from ultralytics import YOLO
@@ -89,18 +90,7 @@ def _extract_text_with_engine(engine, crop) -> str:
 def _extract_texts_with_engine(engine, crops) -> List[str]:
     if not crops:
         return []
-    # Fast path: recognition-only per crop, typically faster than generic predict().
-    recog_texts: List[str] = []
-    recog_ok = False
-    try:
-        for crop in crops:
-            recog_texts.append(_extract_text_with_engine(engine, crop))
-        recog_ok = True
-    except Exception:
-        recog_ok = False
-    if recog_ok and len(recog_texts) == len(crops):
-        return recog_texts
-
+    # Prefer batched inference first to reduce per-call overhead.
     try:
         outputs = list(engine.predict(crops))
     except Exception:
@@ -117,9 +107,14 @@ def _extract_texts_with_engine(engine, crops) -> List[str]:
         else:
             text = ""
         texts.append(text.strip())
-    if len(texts) != len(crops):
+    if len(texts) == len(crops):
+        return texts
+
+    # Fallback: robust per-crop extraction if batch output is incomplete.
+    try:
         return [_extract_text_with_engine(engine, crop) for crop in crops]
-    return texts
+    except Exception:
+        return texts
 
 
 def _extract_codes_from_text(text: str, code_re) -> List[str]:
@@ -148,6 +143,16 @@ def _extract_codes_from_text(text: str, code_re) -> List[str]:
     return sorted(list({c for c in codes if c}))
 
 
+def _run_with_timeout(func, timeout_sec: float, *args):
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(func, *args)
+    try:
+        return fut.result(timeout=max(0.2, float(timeout_sec)))
+    finally:
+        # Do not wait for unfinished OCR task to complete.
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
 def detect_and_ocr_with_wenzi(
     image_paths: List[Path],
     model,
@@ -161,6 +166,8 @@ def detect_and_ocr_with_wenzi(
     imgsz: int = 640,
     ocr_fallback_full: bool = False,
     ocr_fast_max_side: int = 256,
+    ocr_timeout_ms: int = 8000,
+    max_ocr_items: int = 0,
 ) -> List[Dict]:
     reports: List[Dict] = []
     annotated_dir.mkdir(parents=True, exist_ok=True)
@@ -224,9 +231,16 @@ def detect_and_ocr_with_wenzi(
         die_crops_fast = []
         die_crops_full = []
         die_indexes = []
-        for i, (_area, _cid, cname, _conf, x1, y1, x2, y2) in enumerate(candidates):
+        die_items = []
+        for i, (area, _cid, cname, conf, x1, y1, x2, y2) in enumerate(candidates):
             if cname.lower() != "die":
                 continue
+            die_items.append((i, float(conf), int(area), x1, y1, x2, y2))
+
+        if max_ocr_items and max_ocr_items > 0 and len(die_items) > max_ocr_items:
+            die_items = sorted(die_items, key=lambda x: (x[1], x[2]), reverse=True)[:max_ocr_items]
+
+        for i, _conf, _area, x1, y1, x2, y2 in die_items:
             crop = img[y1:y2, x1:x2]
             die_crops_fast.append(_resize_crop_for_ocr(crop, max_side=max(96, int(ocr_fast_max_side))))
             if ocr_fallback_full:
@@ -236,17 +250,31 @@ def detect_and_ocr_with_wenzi(
         die_texts: Dict[int, str] = {}
         to0 = cv2.getTickCount()
         if ocr_engine is not None and die_crops_fast:
-            fast_texts = _extract_texts_with_engine(ocr_engine, die_crops_fast)
+            timeout_sec = max(0.2, float(ocr_timeout_ms) / 1000.0)
+            timed_out = False
+            try:
+                fast_texts = _run_with_timeout(_extract_texts_with_engine, timeout_sec, ocr_engine, die_crops_fast)
+            except concurrent.futures.TimeoutError:
+                timed_out = True
+                fast_texts = []
+            except Exception:
+                fast_texts = []
             fallback_pos = []
             for pos, (idx, txt) in enumerate(zip(die_indexes, fast_texts)):
-                # Accept fast result only when it already yields usable code(s).
-                if _extract_codes_from_text(txt, code_re):
-                    die_texts[idx] = txt
-                else:
+                text = str(txt).strip() if txt is not None else ""
+                # Always keep OCR text for UI visibility, even when no code is parsed.
+                if text:
+                    die_texts[idx] = text
+                if not _extract_codes_from_text(text, code_re):
                     fallback_pos.append(pos)
-            if ocr_fallback_full and fallback_pos:
+            if (not timed_out) and ocr_fallback_full and fallback_pos:
                 fallback_crops = [die_crops_full[pos] for pos in fallback_pos]
-                fallback_texts = _extract_texts_with_engine(ocr_engine, fallback_crops)
+                try:
+                    fallback_texts = _run_with_timeout(
+                        _extract_texts_with_engine, timeout_sec, ocr_engine, fallback_crops
+                    )
+                except Exception:
+                    fallback_texts = []
                 for pos, txt in zip(fallback_pos, fallback_texts):
                     die_texts[die_indexes[pos]] = txt
 

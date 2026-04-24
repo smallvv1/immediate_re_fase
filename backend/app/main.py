@@ -10,10 +10,11 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from ctypes import POINTER, byref, c_ubyte, cast
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -120,9 +121,20 @@ class WorkflowService:
         self.camera_height = int(self.cfg.get("camera", {}).get("height", 0))
         self.camera_provider = str(self.cfg.get("camera", {}).get("provider", "opencv")).strip().lower()
         self.camera_live_provider = str(self.cfg.get("camera", {}).get("live_provider", "")).strip().lower()
+        self.hik_only_mode = bool(self.cfg.get("camera", {}).get("hik_only_mode", True))
         if not self.camera_live_provider:
             # In hik_script mode, prefer SDK stream for realtime preview.
             self.camera_live_provider = "hik_sdk" if self.camera_provider == "hik_script" else self.camera_provider
+        # `hik_script` launches an external process and cannot provide realtime preview.
+        # Normalize it to SDK stream mode and let preview logic fallback to OpenCV if needed.
+        if self.camera_live_provider == "hik_script":
+            self.camera_live_provider = "hik_sdk"
+        if self.hik_only_mode:
+            # Force realtime-capable Hik SDK path in hik-only mode.
+            if self.camera_provider not in {"hik_script", "hik_sdk"}:
+                self.camera_provider = "hik_sdk"
+            if self.camera_live_provider not in {"hik_script", "hik_sdk"}:
+                self.camera_live_provider = "hik_sdk"
         self.camera_source = str(self.cfg.get("camera", {}).get("source", "")).strip()
         self.camera_source_prefer = bool(self.cfg.get("camera", {}).get("source_prefer", True))
         self.camera_source_fallback_to_index = bool(
@@ -146,6 +158,7 @@ class WorkflowService:
         self.capture_mode = str(capture_cfg.get("mode", "fast"))
         self.capture_preview_mode = str(capture_cfg.get("preview_mode", "ultrafast"))
         self.capture_headless = bool(capture_cfg.get("headless", True))
+        self.capture_script_timeout_sec = float(capture_cfg.get("script_timeout_sec", 8.0))
         self.preview_interval_sec = float(capture_cfg.get("preview_interval_sec", 0.033))
         self.preview_fps = float(capture_cfg.get("preview_fps", 30.0))
         wenzi_cfg = self.cfg.get("wenzi", {})
@@ -159,6 +172,8 @@ class WorkflowService:
         self.wenzi_stable_mode = bool(wenzi_cfg.get("stable_mode", True))
         self.wenzi_ocr_fallback_full = bool(wenzi_cfg.get("ocr_fallback_full", False))
         self.wenzi_ocr_fast_max_side = int(wenzi_cfg.get("ocr_fast_max_side", 256))
+        self.wenzi_ocr_timeout_ms = int(wenzi_cfg.get("ocr_timeout_ms", 8000))
+        self.wenzi_max_ocr_items = int(wenzi_cfg.get("max_ocr_items", 0))
         if self.wenzi_max_die_boxes <= 0:
             # Auto-limit OCR workload on noisy frames:
             # only cap die boxes (tool/pin never run OCR in wenzi pipeline).
@@ -187,6 +202,12 @@ class WorkflowService:
         self._stream_payload_size = 0
         self._stream_device_index = None
         self._stream_opening = False
+        self._stream_last_error = ""
+        self._stream_last_error_ts = 0.0
+        self._cv_stream_lock = threading.Lock()
+        self._cv_stream_cap = None
+        self._cv_stream_key = None
+        self._analyze_lock = threading.Lock()
 
     def _open_hik_device_with_fallback(self, cam) -> int:
         # Keep first-frame latency low: try fast/common modes first.
@@ -509,6 +530,78 @@ class WorkflowService:
         with self._stream_lock:
             self._close_hik_stream_unlocked()
 
+    def _close_cv_stream_unlocked(self):
+        cap = self._cv_stream_cap
+        self._cv_stream_cap = None
+        self._cv_stream_key = None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    def _close_cv_stream(self):
+        with self._cv_stream_lock:
+            self._close_cv_stream_unlocked()
+
+    def _open_cv_stream_unlocked(self, camera_index: Optional[int], provider: str):
+        idx = self.camera_index_default if camera_index is None else int(camera_index)
+        p = str(provider or "").strip().lower()
+        if p in {"hik_sdk", "hik_script"}:
+            raise RuntimeError(f"Provider {p} is not a cv stream provider")
+
+        use_source_first = self.camera_source_prefer and bool(self.camera_source)
+        source = self.camera_source if use_source_first else idx
+        key = (str(p), str(source))
+        if self._cv_stream_cap is not None and self._cv_stream_key == key:
+            return self._cv_stream_cap
+
+        self._close_cv_stream_unlocked()
+        cap = None
+        if isinstance(source, str):
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(source)
+        else:
+            cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(int(source))
+
+        if not cap.isOpened():
+            if use_source_first and self.camera_source_fallback_to_index:
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(idx)
+                key = (str(p), str(idx))
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open live stream source: {source}")
+
+        if self.camera_width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_width)
+        if self.camera_height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_height)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        self._cv_stream_cap = cap
+        self._cv_stream_key = key
+        return cap
+
+    def _capture_cv_stream_frame(self, camera_index: Optional[int], provider: str):
+        with self._cv_stream_lock:
+            cap = self._open_cv_stream_unlocked(camera_index, provider)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                # Reopen once to recover from transient stream errors.
+                self._close_cv_stream_unlocked()
+                cap = self._open_cv_stream_unlocked(camera_index, provider)
+                ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError("Failed to read frame from live stream")
+            return frame
+
     def _open_hik_stream(self, device_index: int):
         self._ensure_hik_sdk()
         if not self._hik_sdk_loaded:
@@ -588,6 +681,8 @@ class WorkflowService:
             self._stream_camera = cam
             self._stream_payload_size = int(st_param.nCurValue)
             self._stream_device_index = int(device_index)
+            self._stream_last_error = ""
+            self._stream_last_error_ts = 0.0
 
         settle_frames = max(0, int(self.hik_ae_settle_frames)) if (self.hik_auto_exposure or self.hik_auto_gain) else 0
         if settle_frames > 0:
@@ -631,9 +726,11 @@ class WorkflowService:
                 self._cache_live_frame(idx, frame)
             except Exception:
                 pass
-        except Exception:
+        except Exception as e:
             # Non-fatal: stream endpoint will retry on demand.
-            pass
+            with self._stream_lock:
+                self._stream_last_error = str(e)
+                self._stream_last_error_ts = time.time()
         finally:
             self._stream_opening = False
 
@@ -762,18 +859,21 @@ class WorkflowService:
     def capture_image(self, camera_index: Optional[int]) -> Path:
         idx = self.camera_index_default if camera_index is None else int(camera_index)
 
-        # Prefer cached live frame, but fallback to on-demand capture so
-        # capture-and-detect does not strictly depend on /api/live-stream.
-        cached = self._get_cached_live_frame(idx, max_age_sec=1.0)
+        # Always prefer latest cached preview frame to minimize click-to-result latency.
+        cached = self._get_cached_live_frame(idx, max_age_sec=10.0)
         if cached is None:
             try:
-                cached = self._get_live_frame(idx)
+                cached = self._get_preview_frame(idx)
                 self._cache_live_frame(idx, cached)
             except Exception:
-                raise RuntimeError(
-                    f"No recent live frame for camera_index={idx}, and on-demand capture failed. "
-                    "Please check camera connection and retry."
-                )
+                try:
+                    cached = self._get_live_frame(idx)
+                    self._cache_live_frame(idx, cached)
+                except Exception:
+                    raise RuntimeError(
+                        f"No recent live frame for camera_index={idx}, and on-demand capture failed. "
+                        "Please check camera connection and retry."
+                    )
 
         filename = f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         path = self.capture_dir / filename
@@ -832,7 +932,12 @@ class WorkflowService:
         if os.name == "nt":
             run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.run(cmd, **run_kwargs)
+        try:
+            proc = subprocess.run(cmd, timeout=max(1.0, float(self.capture_script_timeout_sec)), **run_kwargs)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Hik capture script timed out after {self.capture_script_timeout_sec:.1f}s: {' '.join(cmd)}"
+            )
 
         # Some third-party scripts do not accept --headless; retry automatically.
         if (
@@ -841,10 +946,16 @@ class WorkflowService:
             and "unrecognized arguments: --headless" in ((proc.stderr or "") + (proc.stdout or ""))
         ):
             cmd = list(cmd_base)
-            proc = subprocess.run(
-                cmd,
-                **run_kwargs,
-            )
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    timeout=max(1.0, float(self.capture_script_timeout_sec)),
+                    **run_kwargs,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    f"Hik capture script timed out after {self.capture_script_timeout_sec:.1f}s: {' '.join(cmd)}"
+                )
 
         if proc.returncode != 0:
             msg = (
@@ -891,6 +1002,10 @@ class WorkflowService:
             if img is None:
                 raise RuntimeError("Failed to decode frame from hik_script capture")
             return img
+        if self.hik_only_mode:
+            raise RuntimeError(
+                f"Provider {p} is disabled in hik_only_mode; only hik_sdk/hik_script are allowed"
+            )
 
         use_source_first = self.camera_source_prefer and bool(self.camera_source)
         if use_source_first:
@@ -902,7 +1017,24 @@ class WorkflowService:
         return self._capture_by_index(idx)
 
     def _get_live_frame(self, camera_index: Optional[int]):
-        return self._get_live_frame_by_provider(camera_index, self.camera_provider)
+        try:
+            return self._get_live_frame_by_provider(camera_index, self.camera_provider)
+        except Exception:
+            # Hard fallback for unstable Hik SDK stream:
+            # if script capture exists, use it to guarantee a frame.
+            if str(self.camera_provider).lower() == "hik_sdk":
+                try:
+                    src = self._capture_by_hik_script(self.capture_preview_mode or self.capture_mode)
+                    img = cv2.imread(str(src))
+                    try:
+                        src.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    if img is not None:
+                        return img
+                except Exception:
+                    pass
+            raise
 
     def _get_preview_frame(self, camera_index: Optional[int]):
         # Realtime preview can use a different provider than capture/detect.
@@ -915,28 +1047,58 @@ class WorkflowService:
             if cached is not None:
                 return cached
             self._ensure_hik_stream_async(idx)
+            if not self._stream_opening:
+                with self._stream_lock:
+                    last_error = (self._stream_last_error or "").strip()
+                if last_error:
+                    # Fallback to script frame when SDK stream cannot be opened.
+                    try:
+                        src = self._capture_by_hik_script(self.capture_preview_mode or self.capture_mode)
+                        img = cv2.imread(str(src))
+                        try:
+                            src.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        if img is not None:
+                            return img
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Hik realtime stream open failed: {last_error}")
             # Fallback immediately so UI still shows image while SDK stream initializes.
             if self.camera_provider != "hik_sdk":
                 # For script fallback, reuse recent frame to avoid reopening camera every stream tick.
                 cached = self._get_cached_live_frame(idx, max_age_sec=1.0)
                 if cached is not None:
                     return cached
-                if str(self.camera_provider).lower() == "hik_script":
-                    src = self._capture_by_hik_script(self.capture_preview_mode)
-                    img = cv2.imread(str(src))
-                    try:
-                        src.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    if img is None:
-                        raise RuntimeError("Failed to decode frame from hik_script preview capture")
-                    return img
+                # Fallback to Hik script only (still Hik camera, never host webcam).
                 return self._get_live_frame_by_provider(camera_index, self.camera_provider)
+            # Even when provider is hik_sdk, allow script fallback to avoid blank input panel.
+            try:
+                src = self._capture_by_hik_script(self.capture_preview_mode or self.capture_mode)
+                img = cv2.imread(str(src))
+                try:
+                    src.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if img is not None:
+                    return img
+            except Exception:
+                pass
             raise RuntimeError("Hik realtime stream is initializing")
+        if str(self.camera_live_provider).lower() not in {"hik_script", "hik_sdk"}:
+            if self.hik_only_mode:
+                raise RuntimeError(
+                    f"live_provider={self.camera_live_provider} is disabled in hik_only_mode"
+                )
+            return self._capture_cv_stream_frame(camera_index, self.camera_live_provider)
         try:
             return self._get_live_frame_by_provider(camera_index, self.camera_live_provider)
         except Exception:
             if self.camera_live_provider != self.camera_provider:
+                if self.hik_only_mode:
+                    raise
+                if str(self.camera_provider).lower() not in {"hik_script", "hik_sdk"}:
+                    return self._capture_cv_stream_frame(camera_index, self.camera_provider)
                 return self._get_live_frame_by_provider(camera_index, self.camera_provider)
             raise
 
@@ -960,57 +1122,70 @@ class WorkflowService:
             self._preview_last_ts = time.time()
             return out
 
-    def analyze(self, image_path: Path) -> Dict:
+    def analyze(self, image_path: Path, skip_ocr: bool = False) -> Dict:
         self.ensure_model()
-        self.ensure_ocr()
+        if not skip_ocr:
+            self.ensure_ocr()
 
-        if self.use_wenzi_pipeline:
-            image_reports = detect_and_ocr_with_wenzi(
-                image_paths=[image_path],
-                model=self.model,
-                ocr_engine=self.ocr_engine,
-                conf_threshold=self.conf_threshold,
-                class_conf_thresholds=self.class_conf_thresholds,
-                code_pattern=self.code_pattern,
-                annotated_dir=self.annotated_dir,
-                min_box_area=self.wenzi_min_box_area,
-                max_die_boxes=self.wenzi_max_die_boxes,
-                imgsz=self.wenzi_fast_imgsz,
-                ocr_fallback_full=self.wenzi_ocr_fallback_full,
-                ocr_fast_max_side=self.wenzi_ocr_fast_max_side,
-            )
-            missing_eval = evaluate_missing(image_reports, self.expected_tools)
-            # Accuracy-preserving fallback: rerun with full resolution only when
-            # fast path indicates missing items (count issue), not code-only gaps.
-            missing_items = int(missing_eval.get("total_missing_items", 0))
-            if (not self.wenzi_stable_mode) and self.wenzi_two_stage and 0 < missing_items <= self.wenzi_two_stage_max_missing_items:
+        ocr_engine = None if skip_ocr else self.ocr_engine
+
+        with self._analyze_lock:
+            if self.use_wenzi_pipeline:
                 image_reports = detect_and_ocr_with_wenzi(
                     image_paths=[image_path],
                     model=self.model,
-                    ocr_engine=self.ocr_engine,
+                    ocr_engine=ocr_engine,
                     conf_threshold=self.conf_threshold,
                     class_conf_thresholds=self.class_conf_thresholds,
                     code_pattern=self.code_pattern,
                     annotated_dir=self.annotated_dir,
                     min_box_area=self.wenzi_min_box_area,
                     max_die_boxes=self.wenzi_max_die_boxes,
-                    imgsz=self.wenzi_full_imgsz,
+                    imgsz=self.wenzi_fast_imgsz,
                     ocr_fallback_full=self.wenzi_ocr_fallback_full,
                     ocr_fast_max_side=self.wenzi_ocr_fast_max_side,
+                    ocr_timeout_ms=self.wenzi_ocr_timeout_ms,
+                    max_ocr_items=self.wenzi_max_ocr_items,
                 )
                 missing_eval = evaluate_missing(image_reports, self.expected_tools)
-        else:
-            image_reports = detect_and_ocr(
-                image_paths=[image_path],
-                model=self.model,
-                ocr_engine=self.ocr_engine,
-                conf_threshold=self.conf_threshold,
-                class_conf_thresholds=self.class_conf_thresholds,
-                score_thresh=self.ocr_score_thresh,
-                code_pattern=self.code_pattern,
-                annotated_dir=self.annotated_dir,
-            )
-            missing_eval = evaluate_missing(image_reports, self.expected_tools)
+                # Accuracy-preserving fallback: rerun with full resolution only when
+                # fast path indicates missing items (count issue), not code-only gaps.
+                missing_items = int(missing_eval.get("total_missing_items", 0))
+                if (
+                    (not skip_ocr)
+                    and (not self.wenzi_stable_mode)
+                    and self.wenzi_two_stage
+                    and 0 < missing_items <= self.wenzi_two_stage_max_missing_items
+                ):
+                    image_reports = detect_and_ocr_with_wenzi(
+                        image_paths=[image_path],
+                        model=self.model,
+                        ocr_engine=ocr_engine,
+                        conf_threshold=self.conf_threshold,
+                        class_conf_thresholds=self.class_conf_thresholds,
+                        code_pattern=self.code_pattern,
+                        annotated_dir=self.annotated_dir,
+                        min_box_area=self.wenzi_min_box_area,
+                        max_die_boxes=self.wenzi_max_die_boxes,
+                        imgsz=self.wenzi_full_imgsz,
+                        ocr_fallback_full=self.wenzi_ocr_fallback_full,
+                        ocr_fast_max_side=self.wenzi_ocr_fast_max_side,
+                        ocr_timeout_ms=self.wenzi_ocr_timeout_ms,
+                        max_ocr_items=self.wenzi_max_ocr_items,
+                    )
+                    missing_eval = evaluate_missing(image_reports, self.expected_tools)
+            else:
+                image_reports = detect_and_ocr(
+                    image_paths=[image_path],
+                    model=self.model,
+                    ocr_engine=ocr_engine,
+                    conf_threshold=self.conf_threshold,
+                    class_conf_thresholds=self.class_conf_thresholds,
+                    score_thresh=self.ocr_score_thresh,
+                    code_pattern=self.code_pattern,
+                    annotated_dir=self.annotated_dir,
+                )
+                missing_eval = evaluate_missing(image_reports, self.expected_tools)
         report = image_reports[0] if image_reports else {}
 
         missing_parts = []
@@ -1064,7 +1239,7 @@ class WorkflowService:
 
         return {
             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-            "ocr_status": self.ocr_status,
+            "ocr_status": "skipped_fast_stage" if skip_ocr else self.ocr_status,
             "capture_image_path": str(image_path),
             "annotated_image_path": report.get("annotated_image_path"),
             "timings_ms": report.get("timings_ms", {}),
@@ -1122,6 +1297,46 @@ def trigger_alarm() -> None:
 
 def create_app(config_path: Path) -> FastAPI:
     service = WorkflowService(config_path)
+    async_jobs: Dict[str, Dict[str, Any]] = {}
+    async_jobs_lock = threading.Lock()
+
+    def _cleanup_async_jobs(max_age_sec: float = 900.0) -> None:
+        now = time.time()
+        with async_jobs_lock:
+            stale = [
+                k
+                for k, v in async_jobs.items()
+                if (now - float(v.get("updated_ts", v.get("created_ts", now)))) > max_age_sec
+            ]
+            for k in stale:
+                async_jobs.pop(k, None)
+
+    def _finalize_result_urls(result: Dict[str, Any], elapsed_ms: int) -> Dict[str, Any]:
+        result["capture_image_url"] = path_to_url(result.get("capture_image_path"))
+        result["annotated_image_url"] = path_to_url(result.get("annotated_image_path"))
+        result["processing_time_ms"] = int(elapsed_ms)
+        result["processing_time_sec"] = round(float(elapsed_ms) / 1000.0, 3)
+        return result
+
+    def _start_async_full_ocr(task_id: str, image_path: Path) -> None:
+        def _worker() -> None:
+            t0 = time.perf_counter()
+            try:
+                full = service.analyze(image_path, skip_ocr=False)
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                _finalize_result_urls(full, elapsed_ms)
+                with async_jobs_lock:
+                    async_jobs[task_id]["status"] = "done"
+                    async_jobs[task_id]["result"] = full
+                    async_jobs[task_id]["updated_ts"] = time.time()
+            except Exception as e:
+                with async_jobs_lock:
+                    async_jobs[task_id]["status"] = "error"
+                    async_jobs[task_id]["error"] = str(e)
+                    async_jobs[task_id]["updated_ts"] = time.time()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -1131,11 +1346,21 @@ def create_app(config_path: Path) -> FastAPI:
             t.start()
         except Exception:
             pass
+        # Warm up model/OCR asynchronously to reduce first-detection latency.
+        try:
+            t2 = threading.Thread(target=service.warmup_runtime, daemon=True)
+            t2.start()
+        except Exception:
+            pass
         try:
             yield
         finally:
             try:
                 service._close_hik_stream()
+            except Exception:
+                pass
+            try:
+                service._close_cv_stream()
             except Exception:
                 pass
 
@@ -1202,6 +1427,45 @@ def create_app(config_path: Path) -> FastAPI:
         }
         return result
 
+    @app.post("/api/capture-and-detect-fast")
+    def capture_and_detect_fast(req: CaptureRequest):
+        _cleanup_async_jobs()
+        t0 = time.perf_counter()
+        try:
+            t_capture0 = time.perf_counter()
+            image_path = service.capture_image(req.camera_index)
+            t_capture1 = time.perf_counter()
+            # Stage-1: fast result without OCR for instant feedback.
+            fast_result = service.analyze(image_path, skip_ocr=True)
+            t_analyze1 = time.perf_counter()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        fast_result["capture_image_url"] = path_to_url(fast_result["capture_image_path"])
+        fast_result["annotated_image_url"] = path_to_url(fast_result.get("annotated_image_path"))
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        fast_result["processing_time_ms"] = elapsed_ms
+        fast_result["processing_time_sec"] = round(elapsed_ms / 1000.0, 3)
+        fast_result["pipeline_time_ms"] = {
+            "capture": int((t_capture1 - t_capture0) * 1000),
+            "analyze_fast": int((t_analyze1 - t_capture1) * 1000),
+            "total": elapsed_ms,
+        }
+        fast_result["result_stage"] = "fast"
+
+        task_id = uuid.uuid4().hex
+        with async_jobs_lock:
+            async_jobs[task_id] = {
+                "status": "pending",
+                "created_ts": time.time(),
+                "updated_ts": time.time(),
+                "result": None,
+                "error": "",
+            }
+        _start_async_full_ocr(task_id, Path(fast_result["capture_image_path"]))
+        fast_result["async_task_id"] = task_id
+        return fast_result
+
     @app.post("/api/detect-upload")
     def detect_upload(image: UploadFile = File(...)):
         t0 = time.perf_counter()
@@ -1229,18 +1493,52 @@ def create_app(config_path: Path) -> FastAPI:
         }
         return result
 
+    @app.get("/api/async-result/{task_id}")
+    def get_async_result(task_id: str):
+        _cleanup_async_jobs()
+        with async_jobs_lock:
+            item = async_jobs.get(task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        status = str(item.get("status", "pending"))
+        if status == "done":
+            result = item.get("result") or {}
+            if result.get("missing_status") == "missing_detected":
+                trigger_alarm()
+            return {"status": "done", "result": result}
+        if status == "error":
+            return {"status": "error", "error": str(item.get("error", "async task failed"))}
+        return {"status": "pending"}
+
     @app.post("/api/live-preview")
     def live_preview(req: CaptureRequest):
+        idx = service.camera_index_default if req.camera_index is None else int(req.camera_index)
         try:
-            # Live preview endpoint is also used as fallback in UI; use capture
-            # provider to guarantee a deterministic frame even when realtime
-            # preview provider is still initializing.
+            # Capture one frame from the realtime preview path.
             out = service.preview_dir / "live.jpg"
-            img = service._get_live_frame(req.camera_index)
+            try:
+                img = service._get_preview_frame(req.camera_index)
+            except Exception as e:
+                cached = service._get_cached_live_frame(idx, max_age_sec=30.0)
+                if cached is not None:
+                    img = cached
+                else:
+                    # Hard fallback: grab one fresh frame via capture path so
+                    # frontend can still render input image when stream path is unstable.
+                    try:
+                        cap_path = service.capture_image(req.camera_index)
+                        img = cv2.imread(str(cap_path))
+                    except Exception:
+                        img = None
+                    if img is None:
+                        raise HTTPException(status_code=503, detail=f"live preview unavailable: {e}")
             ok = cv2.imwrite(str(out), img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not ok:
                 raise RuntimeError("Preview write failed")
             image_path = out
+        except HTTPException:
+            # Preserve original status codes such as 503 (stream initializing/unavailable).
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         return {
@@ -1270,23 +1568,25 @@ def create_app(config_path: Path) -> FastAPI:
                         b"Content-Type: image/jpeg\r\n"
                         b"Cache-Control: no-cache\r\n\r\n" + jpg + b"\r\n"
                     )
-                except Exception as e:
+                except Exception:
                     fail_count += 1
-                    # Return a lightweight placeholder frame so browser doesn't appear to hang forever.
-                    msg = f"Camera unavailable ({fail_count})"
-                    canvas = np.zeros((360, 640, 3), dtype=np.uint8)
-                    cv2.putText(canvas, msg, (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    cv2.putText(canvas, str(e)[:60], (20, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-                    ok, encoded = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                    if ok:
-                        jpg = encoded.tobytes()
-                        yield (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n"
-                            b"Cache-Control: no-cache\r\n\r\n" + jpg + b"\r\n"
-                        )
+                    # Keep stream alive: fallback to cached frame when realtime grab fails.
+                    cached = service._get_cached_live_frame(camera_index, max_age_sec=30.0)
+                    if cached is not None:
+                        ok, encoded = cv2.imencode(".jpg", cached, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                        if ok:
+                            jpg = encoded.tobytes()
+                            yield (
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n"
+                                b"Cache-Control: no-cache\r\n\r\n" + jpg + b"\r\n"
+                            )
+                            time.sleep(interval)
+                            continue
+                    # No cache available yet: keep retrying for a while instead of immediate close.
+                    if fail_count >= 20:
+                        break
                     time.sleep(0.2)
-                    continue
                 time.sleep(interval)
 
         return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
